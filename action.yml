@@ -1,0 +1,160 @@
+name: Bundler audit (changed gems)
+description: >-
+  Run bundler-audit and fail only on advisories against gems this branch added
+  or changed. Advisories that already affect the base branch are reported but
+  do not fail the check, so a pull request never goes red for a CVE it did not
+  introduce. Pair with a scheduled workflow that audits the whole bundle.
+
+inputs:
+  base-ref:
+    description: Branch to compare against. Defaults to the pull request base, then main.
+    required: false
+    default: ""
+  bundler-audit-command:
+    description: How to invoke bundler-audit.
+    required: false
+    default: bundle exec bundler-audit
+
+outputs:
+  introduced-count:
+    description: Number of advisories against gems this branch changed.
+    value: ${{ steps.filter.outputs.introduced-count }}
+  preexisting-count:
+    description: Number of advisories that already affected the base branch.
+    value: ${{ steps.filter.outputs.preexisting-count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve base commit
+      id: base
+      shell: bash
+      env:
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      run: |
+        set -euo pipefail
+        ref="${INPUT_BASE_REF:-}"
+        [ -n "$ref" ] || ref="${PR_BASE_REF:-}"
+        [ -n "$ref" ] || ref="main"
+
+        # The merge base needs the fork point, which a shallow clone hides as
+        # soon as the base branch moves past it. That reads as "no merge base"
+        # rather than as an error, so unshallow before resolving anything.
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --unshallow --no-tags origin "$ref"
+        else
+          git fetch --no-tags origin "$ref"
+        fi
+
+        if ! base_sha="$(git merge-base "origin/$ref" HEAD)"; then
+          echo "::error::No merge base with origin/$ref. Check out with fetch-depth: 0."
+          exit 2
+        fi
+
+        # On a push to the base branch itself the merge base is HEAD, which
+        # would compare the commit to itself and pass unconditionally. Step
+        # back one commit so a merge that introduces a problem still fails.
+        if [ "$base_sha" = "$(git rev-parse HEAD)" ]; then
+          if ! base_sha="$(git rev-parse HEAD~1 2>/dev/null)"; then
+            echo "No parent commit to compare against; treating everything as pre-existing."
+            base_sha=""
+          fi
+        fi
+
+        echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+        echo "Comparing against ${base_sha:-<nothing>}"
+
+    - name: Collect gems this branch changed
+      shell: bash
+      env:
+        BASE_SHA: ${{ steps.base.outputs.base_sha }}
+      run: |
+        set -euo pipefail
+        : > "$RUNNER_TEMP/changed-gems.txt"
+
+        if [ -n "$BASE_SHA" ]; then
+          git diff "$BASE_SHA" HEAD -- Gemfile.lock > "$RUNNER_TEMP/gemfile.diff"
+
+          # Resolved gems sit at exactly four spaces in Gemfile.lock. Their
+          # transitive dependency lines are indented six and are skipped, so a
+          # gem counts only when its own resolved version changed.
+          grep -oE '^[+-]    [A-Za-z0-9_.-]+ \(' "$RUNNER_TEMP/gemfile.diff" \
+            | sed -E 's/^[+-]    //; s/ \($//' \
+            | sort -u > "$RUNNER_TEMP/changed-gems.txt" || true
+        fi
+
+        if [ -s "$RUNNER_TEMP/changed-gems.txt" ]; then
+          echo "Gems changed by this branch:"
+          sed 's/^/  /' "$RUNNER_TEMP/changed-gems.txt"
+        else
+          echo "This branch changes no resolved gem versions."
+        fi
+
+    - name: Run bundler-audit
+      shell: bash
+      env:
+        AUDIT_COMMAND: ${{ inputs.bundler-audit-command }}
+      run: |
+        set -uo pipefail
+
+        # GitHub runs `shell: bash` as `bash -eo pipefail`, so -e is already on
+        # and bundler-audit's exit 1 would abort this step before the exit code
+        # below is ever read. Clear it around the call.
+        set +e
+        $AUDIT_COMMAND check --update --format json \
+          > "$RUNNER_TEMP/audit-full.txt" 2>&1
+        code=$?
+        set -e
+
+        # bundler-audit prints advisory-database progress before the JSON body.
+        awk '/^\{/{found=1} found' "$RUNNER_TEMP/audit-full.txt" > "$RUNNER_TEMP/audit.json"
+
+        # 0 is clean, 1 is "advisories found"; anything else is a real failure,
+        # and so is output we cannot parse. Neither may pass silently.
+        if [ "$code" -gt 1 ] || ! jq empty "$RUNNER_TEMP/audit.json" 2>/dev/null; then
+          echo "::error::bundler-audit failed (exit $code) or produced no JSON"
+          cat "$RUNNER_TEMP/audit-full.txt"
+          exit 2
+        fi
+
+    - name: Fail only on advisories this branch introduced
+      id: filter
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        changed="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$RUNNER_TEMP/changed-gems.txt")"
+        introduced="$(jq --argjson c "$changed" \
+          '[.results[]? | select(.gem.name as $n | $c | index($n))]' "$RUNNER_TEMP/audit.json")"
+        preexisting="$(jq --argjson c "$changed" \
+          '[.results[]? | select(.gem.name as $n | ($c | index($n)) | not)]' "$RUNNER_TEMP/audit.json")"
+
+        n_new="$(jq 'length' <<< "$introduced")"
+        n_old="$(jq 'length' <<< "$preexisting")"
+        echo "introduced-count=$n_new" >> "$GITHUB_OUTPUT"
+        echo "preexisting-count=$n_old" >> "$GITHUB_OUTPUT"
+
+        fmt='.[] | "- **\(.gem.name)** (\(.gem.version)): [\(.advisory.id)](\(.advisory.url)) \(.advisory.criticality // "unknown") — \(.advisory.title)"'
+
+        if [ "$n_old" -gt 0 ]; then
+          {
+            echo "### $n_old pre-existing advisory(s) — not failing this check"
+            echo
+            jq -r "$fmt" <<< "$preexisting"
+            echo
+            echo "These already affect the base branch. The scheduled security audit tracks them."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
+
+        if [ "$n_new" -gt 0 ]; then
+          {
+            echo "### $n_new advisory(s) introduced by this branch"
+            echo
+            jq -r "$fmt" <<< "$introduced"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error::This branch adds or updates gems with known advisories."
+          exit 1
+        fi
+
+        echo "No advisories against gems this branch changed."

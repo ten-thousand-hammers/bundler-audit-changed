@@ -125,10 +125,18 @@ runs:
         set -euo pipefail
 
         changed="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$RUNNER_TEMP/changed-gems.txt")"
+
+        # Only unpatched_gem results describe a gem advisory. bundler-audit also
+        # emits insecure_source results, which carry a `source` and no `gem` or
+        # `advisory` at all -- counting those here would inflate the total and
+        # render a row of nulls. They are reported separately below.
+        advisories='[.results[]? | select(.type == "unpatched_gem")]'
+
         introduced="$(jq --argjson c "$changed" \
-          '[.results[]? | select(.gem.name as $n | $c | index($n))]' "$RUNNER_TEMP/audit.json")"
+          "$advisories | map(select(.gem.name as \$n | \$c | index(\$n)))" "$RUNNER_TEMP/audit.json")"
         preexisting="$(jq --argjson c "$changed" \
-          '[.results[]? | select(.gem.name as $n | ($c | index($n)) | not)]' "$RUNNER_TEMP/audit.json")"
+          "$advisories | map(select(.gem.name as \$n | (\$c | index(\$n)) | not))" "$RUNNER_TEMP/audit.json")"
+        insecure_sources="$(jq '[.results[]? | select(.type == "insecure_source") | .source]' "$RUNNER_TEMP/audit.json")"
 
         n_new="$(jq 'length' <<< "$introduced")"
         n_old="$(jq 'length' <<< "$preexisting")"
@@ -136,6 +144,16 @@ runs:
         echo "preexisting-count=$n_old" >> "$GITHUB_OUTPUT"
 
         fmt='.[] | "- **\(.gem.name)** (\(.gem.version)): [\(.advisory.id)](\(.advisory.url)) \(.advisory.criticality // "unknown") — \(.advisory.title)"'
+
+        # An insecure source is a Gemfile problem rather than a gem advisory, so
+        # it is surfaced but never fails the branch; the scheduled audit owns it.
+        if [ "$(jq 'length' <<< "$insecure_sources")" -gt 0 ]; then
+          {
+            echo "### Insecure Gemfile source(s) — not failing this check"
+            echo
+            jq -r '.[] | "- `\(.)`"' <<< "$insecure_sources"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
 
         if [ "$n_old" -gt 0 ]; then
           {
